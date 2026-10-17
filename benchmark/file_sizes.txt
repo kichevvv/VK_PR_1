@@ -1,0 +1,7 @@
+=== /Users/alaik/VK/sql/10_file_sizes.sql ===
+"bronze.lineitem","2","144.901000000000"
+"silver.large_orders","1","0.001000000000"
+"bronze.customer","1","7.825000000000"
+"bronze.orders","2","34.978000000000"
+"gold.q18","1","0.002000000000"
+"silver.q18_joined","7","0.013000000000"

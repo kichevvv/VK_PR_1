@@ -1,0 +1,7 @@
+=== /Users/alaik/VK/sql/09_stats.sql ===
+"silver.q18_joined","399"
+"bronze.customer","150000"
+"gold.q18","57"
+"silver.large_orders","57"
+"bronze.lineitem","6001215"
+"bronze.orders","1500000"

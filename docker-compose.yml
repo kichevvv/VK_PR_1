@@ -1,0 +1,220 @@
+name: lakehouse-q18
+
+networks:
+  lakehouse:
+    driver: bridge
+
+volumes:
+  minio_data:
+  pg_data:
+  metabase_data:
+  metabase_plugins:
+
+services:
+  minio:
+    # minio/minio и quay.io/minio/minio с осени 2026 недоступны без лицензии.
+    # Silo — публичный drop-in с тем же S3 API и переменными MINIO_*.
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z
+    container_name: lakehouse-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks: [lakehouse]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  minio-init:
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z
+    container_name: lakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [lakehouse]
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin123
+        mc mb --ignore-existing local/warehouse
+        mc anonymous set none local/warehouse
+        echo "bucket warehouse ready"
+
+  db:
+    image: postgres:16
+    container_name: lakehouse-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lakekeeper
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [lakehouse]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lakekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakehouse-migrate
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: This-is-NOT-Secure-local-lab
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@db:5432/lakekeeper
+      RUST_LOG: info
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [lakehouse]
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakehouse-lakekeeper
+    command: ["serve"]
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: This-is-NOT-Secure-local-lab
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@db:5432/lakekeeper
+      RUST_LOG: info
+    ports:
+      - "8181:8181"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks: [lakehouse]
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 5s
+
+  lakekeeper-bootstrap:
+    image: curlimages/curl:8.11.1
+    container_name: lakehouse-bootstrap
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks: [lakehouse]
+    restart: "no"
+    volumes:
+      - ./lakekeeper/create-warehouse.json:/warehouse.json:ro
+      - ./lakekeeper/create-warehouse-alt.json:/warehouse-alt.json:ro
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "bootstrap lakekeeper"
+        curl -sS -o /tmp/boot.out -w "bootstrap_http=%{http_code}\n" \
+          -X POST http://lakekeeper:8181/management/v1/bootstrap \
+          -H "Content-Type: application/json" \
+          -d '{"accept-terms-of-use": true}'
+        cat /tmp/boot.out || true
+        echo
+        echo "create warehouse"
+        WH_CODE=$$(curl -sS -o /tmp/wh.out -w "%{http_code}" \
+          -X POST http://lakekeeper:8181/management/v1/warehouse \
+          -H "Content-Type: application/json" \
+          --data @/warehouse.json)
+        echo "warehouse_http=$${WH_CODE}"
+        cat /tmp/wh.out || true
+        echo
+        if [ "$${WH_CODE}" != "200" ] && [ "$${WH_CODE}" != "201" ] && [ "$${WH_CODE}" != "409" ]; then
+          echo "retry warehouse with alt credential field names"
+          curl -sS -o /tmp/wh2.out -w "warehouse_alt_http=%{http_code}\n" \
+            -X POST http://lakekeeper:8181/management/v1/warehouse \
+            -H "Content-Type: application/json" \
+            --data @/warehouse-alt.json
+          cat /tmp/wh2.out || true
+          echo
+        fi
+
+  trino:
+    image: trinodb/trino:477
+    container_name: lakehouse-trino
+    hostname: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/config.properties:/etc/trino/config.properties:ro
+      - ./trino/jvm.config:/etc/trino/jvm.config:ro
+      - ./sql:/sql:ro
+    depends_on:
+      lakekeeper-bootstrap:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    networks: [lakehouse]
+    healthcheck:
+      test: ["CMD", "curl", "-I", "http://localhost:8080/v1/status"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  metabase-plugin:
+    image: curlimages/curl:8.11.1
+    container_name: lakehouse-metabase-plugin
+    profiles: ["bi"]
+    volumes:
+      - metabase_plugins:/plugins
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        cd /plugins
+        if [ ! -f starburst.metabase-driver.jar ]; then
+          curl -fsSL -o starburst.metabase-driver.jar \
+            "https://github.com/starburstdata/metabase-driver/releases/download/6.1.0/starburst-6.1.0.metabase-driver.jar"
+        fi
+        ls -l /plugins
+
+  metabase:
+    image: metabase/metabase:v0.53.6
+    container_name: lakehouse-metabase
+    profiles: ["bi"]
+    ports:
+      - "3000:3000"
+    environment:
+      MB_JETTY_PORT: 3000
+    volumes:
+      - metabase_data:/metabase-data
+      - metabase_plugins:/plugins
+    depends_on:
+      metabase-plugin:
+        condition: service_completed_successfully
+      trino:
+        condition: service_healthy
+    networks: [lakehouse]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
